@@ -1,0 +1,36 @@
+# .codacy/codacy.yaml
+# Reproducible local analysis config for Codacy CLI
+runtimes:
+  node:
+    enabled: false        # flip to true if you want ESLint
+    version: "22.2.0"
+  python:
+    enabled: true
+    version: "3.11"
+
+tools:
+  pylint:
+    enabled: true
+  bandit:
+    enabled: true
+  # enable ESLint if you have JS/TS:
+  # eslint:
+  #   enabled: true
+
+output:
+  defaultFormat: "sarif"
+  outDir: ".codacy/out"
+
+# cloud-side Globals
+---
+exclude_paths:
+  - ".git/**"
+  - ".vscode/**"
+  - ".venv/**"
+  - "__pycache__/**"
+  - "node_modules/**"
+  - "dist/**"
+  - "build/**"
+  - "bin/**"
+  - "obj/**"
+
