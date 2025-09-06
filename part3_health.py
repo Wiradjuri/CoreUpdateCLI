@@ -2,12 +2,12 @@
 # part3_health.py — Health Check feature with live progress + logs (streaming app scan)
 
 import os, shutil, subprocess, re, json
+import concurrent.futures
 from typing import List
 
 from part1_bootstrap import console, log, LOG_FILE
 from part2_helpers import (
     winget_upgrade,
-    install_windows_updates,
     ensure_deps,               # NEW: global dep guard
     resolve_winget_path,
 )
@@ -101,8 +101,19 @@ def _stream_winget_upgrades(logs: List[str], layout: Layout, progress: Progress,
         current_pct = min(phase_end, current_pct + step)
         progress.update(task_id, completed=current_pct)
 
-    for raw in iter(proc.stdout.readline, ""):
-        line = raw.rstrip()
+    # Read full output but with timeout to avoid hangs
+    try:
+        out, _ = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logs.append("winget scan timed out.")
+        if len(logs) > 20: logs.pop(0)
+        layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
+        progress.update(task_id, completed=phase_end)
+        return apps
+
+    for line in (out or "").splitlines():
+        line = line.rstrip()
         if not line:
             _bump()
             continue
@@ -130,7 +141,6 @@ def _stream_winget_upgrades(logs: List[str], layout: Layout, progress: Progress,
             layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
             _bump()
 
-    proc.wait()
     progress.update(task_id, completed=phase_end)
     return apps
 
@@ -173,22 +183,18 @@ $rows | ConvertTo-Json -Depth 4
     logs.append("Checking Windows updates…")
     layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
 
+    # Read output with timeout to avoid blocking indefinitely
     buf: List[str] = []
-    current_pct = phase_start
-    def _bump():
-        nonlocal current_pct
-        step = (phase_end - phase_start) / 40.0
-        current_pct = min(phase_end, current_pct + step)
-        progress.update(task_id, completed=current_pct)
-
-    for raw in iter(proc.stdout.readline, ""):
-        s = raw.rstrip()
-        if s:
-            buf.append(s)
-        _bump()
-
-    proc.wait()
-    out = "\n".join(buf).strip()
+    try:
+        out, _ = proc.communicate(timeout=40)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logs.append("Windows update scan timed out.")
+        if len(logs) > 20: logs.pop(0)
+        layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
+        progress.update(task_id, completed=phase_end)
+        return []
+    out = (out or "").strip()
 
     items: List[dict] = []
     try:
@@ -212,7 +218,10 @@ $rows | ConvertTo-Json -Depth 4
             logs.append(f"Windows Update: {title}")
             if len(logs) > 20: logs.pop(0)
             layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
-            _bump()
+            # bump progress incrementally for each reported update
+            current = progress.tasks[0].completed if progress.tasks else phase_start
+            next_pct = min(phase_end, current + ((phase_end - phase_start) / 40.0))
+            progress.update(task_id, completed=next_pct)
     else:
         logs.append("No Windows updates reported.")
         layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
@@ -258,23 +267,26 @@ def health_check():
         if len(logs) > 20: logs.pop(0)
         layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
 
-        # Windows 40..80
-        progress.update(task, description="Preparing PSWindowsUpdate…")
-        logs.append("Preparing PSWindowsUpdate…")
-        layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
-        os_items = _scan_windows_updates_quiet(logs, layout, progress, task_id=task, phase_start=40.0, phase_end=80.0)
+    # Windows updates removed: skip this phase to avoid PSWindowsUpdate dependency/hangs
+    progress.update(task, description="Windows updates disabled — skipping…")
+    logs.append("Windows updates disabled; skipping PowerShell scan.")
+    if len(logs) > 20: logs.pop(0)
+    layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
+    # advance progress to end of the Windows phase
+    progress.update(task, completed=80.0)
+    os_items = []
 
-        # Junk 80..100
-        progress.update(task, description="Scanning junk files…")
-        logs.append("Scanning junk files…")
-        layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
-        junk_size = calc_size(get_temp_paths())
-        logs.append(f"Junk size detected: {human_bytes(junk_size)}")
-        if len(logs) > 20: logs.pop(0)
-        layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
-        progress.update(task, completed=100.0)
-        logs.append("Scan complete.")
-        layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
+    # Junk 80..100
+    progress.update(task, description="Scanning junk files…")
+    logs.append("Scanning junk files…")
+    layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
+    junk_size = calc_size(get_temp_paths())
+    logs.append(f"Junk size detected: {human_bytes(junk_size)}")
+    if len(logs) > 20: logs.pop(0)
+    layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
+    progress.update(task, completed=100.0)
+    logs.append("Scan complete.")
+    layout["logs"].update(Panel(Text("\n".join(logs[-20:])), title="Live Log"))
 
     console.print("\n[bold cyan]Health Summary[/]")
     console.print(f"- Apps needing updates: [yellow]{len(apps)}[/]")
@@ -291,8 +303,7 @@ def health_check():
         winget_upgrade([a["Id"] for a in apps])
 
     if os_items:
-        console.print("\n[bold green]Installing Windows updates…[/]")
-        install_windows_updates([u["UpdateId"] for u in os_items])
+        console.print("\n[bold green]Windows updates were detected but automatic installation is disabled.[/]")
 
     if junk_size > 0:
         console.print("\n[bold green]Cleaning junk…[/]")
